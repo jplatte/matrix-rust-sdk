@@ -34,6 +34,7 @@ docs = ["encryption", "sled_cryptostore", "sled_state_store", "sso_login"]
 dashmap = "4.0.2"
 futures = "0.3.15"
 http = "0.2.4"
+serde = "1.0.126"
 serde_json = "1.0.64"
 thiserror = "1.0.25"
 tracing = "0.1.26"

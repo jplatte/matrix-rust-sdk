@@ -12,62 +12,219 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use std::ops::Deref;
 
-use matrix_sdk_common::async_trait;
-use ruma::{
-    api::client::r0::push::get_notifications::Notification,
-    events::{
-        call::{
-            answer::AnswerEventContent, candidates::CandidatesEventContent,
-            hangup::HangupEventContent, invite::InviteEventContent,
-        },
-        custom::CustomEventContent,
-        fully_read::FullyReadEventContent,
-        ignored_user_list::IgnoredUserListEventContent,
-        presence::PresenceEvent,
-        push_rules::PushRulesEventContent,
-        reaction::ReactionEventContent,
-        receipt::ReceiptEventContent,
-        room::{
-            aliases::AliasesEventContent,
-            avatar::AvatarEventContent,
-            canonical_alias::CanonicalAliasEventContent,
-            join_rules::JoinRulesEventContent,
-            member::MemberEventContent,
-            message::{feedback::FeedbackEventContent, MessageEventContent as MsgEventContent},
-            name::NameEventContent,
-            power_levels::PowerLevelsEventContent,
-            redaction::SyncRedactionEvent,
-            tombstone::TombstoneEventContent,
-        },
-        typing::TypingEventContent,
-        AnyGlobalAccountDataEvent, AnyRoomAccountDataEvent, AnyStrippedStateEvent,
-        AnySyncEphemeralRoomEvent, AnySyncMessageEvent, AnySyncRoomEvent, AnySyncStateEvent,
-        GlobalAccountDataEvent, RoomAccountDataEvent, StrippedStateEvent, SyncEphemeralRoomEvent,
-        SyncMessageEvent, SyncStateEvent,
-    },
-    serde::Raw,
-    RoomId,
+//! Types and traits related for event handlers. For usage, see
+//! [`Client::register_event_handler`].
+
+use std::{future::Future, sync::Arc};
+
+use ruma::events::{
+    self, EphemeralRoomEventContent, GlobalAccountDataEvent, GlobalAccountDataEventContent,
+    MessageEventContent, RedactedMessageEventContent, RedactedStateEventContent,
+    RedactedStrippedStateEvent, RedactedSyncMessageEvent, RedactedSyncStateEvent,
+    RoomAccountDataEvent, RoomAccountDataEventContent, StateEventContent, StrippedStateEvent,
+    SyncEphemeralRoomEvent, SyncMessageEvent, SyncStateEvent, ToDeviceEvent, ToDeviceEventContent,
 };
 use serde_json::value::RawValue as RawJsonValue;
 
 use crate::{deserialized_responses::SyncResponse, room::Room, Client};
 
-pub(crate) struct Handler {
-    pub(crate) inner: Box<dyn EventHandler>,
-    pub(crate) client: Client,
+// TODO: Move to Ruma
+/// An event with a statically known type.
+pub trait StaticEvent {
+    /// The event type, for example `m.room.message`.
+    const EVENT_TYPE: &'static str;
 }
 
-impl Deref for Handler {
-    type Target = dyn EventHandler;
+impl StaticEvent for StrippedStateEvent<events::room::member::MemberEventContent> {
+    const EVENT_TYPE: &'static str = "m.room.member";
+}
 
-    fn deref(&self) -> &Self::Target {
-        &*self.inner
+/// Interface for event handlers.
+///
+/// This trait is an abstraction for a certain kind of functions / closures,
+/// specifically:
+///
+/// * They must have at least one argument, which is the event itself, a type
+///   that implements [`StaticEvent`]. Any additional arguments need to
+///   implement the [`EventHandlerContext`] trait.
+/// * Their return type has to be one of: `()`, `Result<(), impl
+///   std::error::Error>` or `anyhow::Result<()>` (requires the `anyhow` Cargo
+///   feature to be enabled)
+pub trait EventHandler<Ev, Ctx>: Clone + Send + Sync + 'static {
+    /// The future returned by `handle_event`.
+    #[doc(hidden)]
+    type Future: Future + Send;
+
+    /// The event type being handled, for example `m.room.message`.
+    #[doc(hidden)]
+    const EVENT_TYPE: &'static str;
+
+    /// Create a future for handling the given event.
+    ///
+    /// `ctx` provides additional context about the event, for example the room
+    /// it appeared in.
+    #[doc(hidden)]
+    fn handle_event(&self, ev: Ev, ctx: Ctx) -> Self::Future;
+}
+
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct InternalEventHandlerCtx {
+    client: Client,
+    raw: Arc<RawJsonValue>,
+    room: Option<Room>,
+}
+
+impl<Ev, F, Fut> EventHandler<Ev, ()> for F
+where
+    Ev: StaticEvent,
+    F: Fn(Ev) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future + Send,
+    Fut::Output: EventHandlerResult,
+{
+    type Future = Fut;
+    const EVENT_TYPE: &'static str = Ev::EVENT_TYPE;
+
+    fn handle_event(&self, ev: Ev, _ctx: ()) -> Self::Future {
+        (self)(ev)
     }
 }
 
-impl Handler {
+/// An event that appears in the scope of a room.
+pub trait RoomEvent {}
+
+impl<C: EphemeralRoomEventContent> RoomEvent for SyncEphemeralRoomEvent<C> {}
+impl<C: RoomAccountDataEventContent> RoomEvent for RoomAccountDataEvent<C> {}
+impl<C: StateEventContent> RoomEvent for StrippedStateEvent<C> {}
+impl<C: MessageEventContent> RoomEvent for SyncMessageEvent<C> {}
+impl<C: StateEventContent> RoomEvent for SyncStateEvent<C> {}
+
+impl<C: RedactedStateEventContent> RoomEvent for RedactedStrippedStateEvent<C> {}
+impl<C: RedactedMessageEventContent> RoomEvent for RedactedSyncMessageEvent<C> {}
+impl<C: RedactedStateEventContent> RoomEvent for RedactedSyncStateEvent<C> {}
+
+// TODO: Add custom MessageEvent, StateEvent & StrippedStateEvent types that can
+// represent both redacted and regular events. Implement `RoomEvent` for those.
+// Possible even remove the existing impls except for EphemeralRoomEvent &
+// RoomAccountDataEvent.
+
+/// Event handler context for room-specific events.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct RoomEventCtx {
+    /// The SDK client.
+    ///
+    /// Provided so event handlers can access it without being defined as
+    /// closures that clone + capture the client.
+    pub client: Client,
+
+    /// The room this event appeared in.
+    pub room: Room,
+
+    /// The raw event (use this for "show source"-like functionality).
+    pub raw: Arc<RawJsonValue>,
+}
+
+impl<Ev, F, Fut> EventHandler<Ev, RoomEventCtx> for F
+where
+    Ev: StaticEvent + RoomEvent,
+    F: Fn(Ev, RoomEventCtx) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future + Send,
+    Fut::Output: EventHandlerResult,
+{
+    type Future = Fut;
+    const EVENT_TYPE: &'static str = Ev::EVENT_TYPE;
+
+    fn handle_event(&self, ev: Ev, ctx: RoomEventCtx) -> Self::Future {
+        (self)(ev, ctx)
+    }
+}
+
+/// An event that appears outside of any room's scope.
+pub trait NonRoomEvent {}
+
+impl<C: GlobalAccountDataEventContent> NonRoomEvent for GlobalAccountDataEvent<C> {}
+impl<C: ToDeviceEventContent> NonRoomEvent for ToDeviceEvent<C> {}
+
+/// Event handler context for non-room-specific events.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct GlobalEventCtx {
+    /// The SDK client.
+    ///
+    /// Provided so event handlers can access it without being defined as
+    /// closures that clone + capture the client.
+    pub client: Client,
+
+    /// The raw event (use this for "show source"-like functionality).
+    pub raw: Arc<RawJsonValue>,
+}
+
+impl<Ev, F, Fut> EventHandler<Ev, GlobalEventCtx> for F
+where
+    Ev: StaticEvent + NonRoomEvent,
+    F: Fn(Ev, GlobalEventCtx) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future + Send,
+    Fut::Output: EventHandlerResult,
+{
+    type Future = Fut;
+    const EVENT_TYPE: &'static str = Ev::EVENT_TYPE;
+
+    fn handle_event(&self, ev: Ev, ctx: GlobalEventCtx) -> Self::Future {
+        (self)(ev, ctx)
+    }
+}
+
+/// Return types supported for event handlers implement this trait.
+///
+/// It is not meant to be implemented outside of matrix-sdk.
+pub trait EventHandlerResult: Sized {
+    #[doc(hidden)]
+    fn print_error(&self, ctx: &EventHandlerResultCtx);
+}
+
+#[doc(hidden)]
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct EventHandlerResultCtx {
+    pub event_type: &'static str,
+}
+
+impl EventHandlerResult for () {
+    fn print_error(&self, _ctx: &EventHandlerResultCtx) {}
+}
+
+impl<E: std::error::Error> EventHandlerResult for Result<(), E> {
+    fn print_error(&self, ctx: &EventHandlerResultCtx) {
+        if let Err(e) = self {
+            tracing::error!("Event handler for `{}` failed: {}", ctx.event_type, e);
+        }
+    }
+}
+
+//impl EventHandlerResult for anyhow::Result<()> {
+//    fn print_error(&self, ctx: &EventHandlerResultCtx) {
+//        if let Err(e) = self {
+//            tracing::error!("Event handler for `{}` failed: {:?}",
+// ctx.event_type, e);        }
+//    }
+//}
+
+impl From<InternalEventHandlerCtx> for RoomEventCtx {
+    fn from(ctx: InternalEventHandlerCtx) -> Self {
+        let room = ctx.room.expect("Missing room context for room event handler");
+        Self { client: ctx.client, raw: ctx.raw, room }
+    }
+}
+
+impl From<InternalEventHandlerCtx> for GlobalEventCtx {
+    fn from(ctx: InternalEventHandlerCtx) -> Self {
+        Self { client: ctx.client, raw: ctx.raw }
+    }
+}
+
+/*impl Handler {
     fn get_room(&self, room_id: &RoomId) -> Option<Room> {
         self.client.get_room(room_id)
     }
@@ -960,4 +1117,4 @@ mod test {
             ],
         )
     }
-}
+}*/

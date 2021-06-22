@@ -90,7 +90,7 @@ pub use ruma;
 
 mod client;
 mod error;
-mod event_handler;
+pub mod event_handler;
 mod http_client;
 /// High-level room API
 pub mod room;
@@ -107,7 +107,6 @@ pub use client::{Client, ClientConfig, LoopCtrl, RequestConfig, SyncSettings};
 #[cfg_attr(feature = "docs", doc(cfg(encryption)))]
 pub use device::Device;
 pub use error::{Error, HttpError, Result};
-pub use event_handler::{CustomEvent, EventHandler};
 pub use http_client::HttpSend;
 pub use room_member::RoomMember;
 #[cfg(not(target_arch = "wasm32"))]

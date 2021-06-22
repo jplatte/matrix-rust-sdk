@@ -92,7 +92,8 @@ pub use matrix_sdk;
 #[doc(no_inline)]
 pub use matrix_sdk::ruma;
 use matrix_sdk::{
-    bytes::Bytes, reqwest::Url, Client, ClientConfig, EventHandler, HttpError, Session,
+    bytes::Bytes, event_handler::EventHandler, reqwest::Url, Client, ClientConfig, HttpError,
+    Session,
 };
 use regex::Regex;
 use ruma::{
@@ -106,6 +107,7 @@ use ruma::{
     },
     assign, identifiers, DeviceId, ServerNameBox, UserId,
 };
+use serde::de::DeserializeOwned;
 use tracing::{info, warn};
 
 mod error;
@@ -354,8 +356,8 @@ impl AppService {
         Ok(entry.value().clone())
     }
 
-    /// Convenience wrapper around [`Client::set_event_handler()`] that attaches
-    /// the event handler to the [`MainUser`]'s [`Client`]
+    /// Convenience wrapper around [`Client::register_event_handler()`] that
+    /// attaches the event handler to the [`MainUser`]'s [`Client`]
     ///
     /// Note that the event handler in the [`AppService`] context only triggers
     /// [`join` room `timeline` events], so no state events or events from the
@@ -370,10 +372,15 @@ impl AppService {
     ///
     /// [`join` room `timeline` events]: https://spec.matrix.org/unstable/client-server-api/#get_matrixclientr0sync
     /// [MSC2409]: https://github.com/matrix-org/matrix-doc/pull/2409
-    pub async fn set_event_handler(&mut self, handler: Box<dyn EventHandler>) -> Result<()> {
+    pub fn register_event_handler<Ev, Ctx, H>(&mut self, handler: H) -> Result<()>
+    where
+        Ev: StaticEvent + DeserializeOwned + Send,
+        Ctx: From<InternalEventHandlerCtx> + Send,
+        H: EventHandler<Ev, Ctx>,
+    {
         let client = self.get_cached_client(None)?;
 
-        client.set_event_handler(handler).await;
+        client.register_event_handler(handler);
 
         Ok(())
     }

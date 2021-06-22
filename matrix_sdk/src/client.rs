@@ -19,6 +19,7 @@ use std::path::PathBuf;
 use std::{
     collections::BTreeMap,
     io::{Cursor, Write},
+    pin::Pin,
 };
 #[cfg(feature = "sso_login")]
 use std::{
@@ -36,6 +37,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use futures::FutureExt;
 use futures_timer::Delay as sleep;
 use http::HeaderValue;
 #[cfg(feature = "sso_login")]
@@ -57,13 +59,15 @@ use mime::{self, Mime};
 use rand::{thread_rng, Rng};
 use reqwest::header::InvalidHeaderValue;
 use ruma::{api::SendAccessToken, events::AnyMessageEventContent, MxcUri};
+use serde::de::DeserializeOwned;
+use serde_json::value::RawValue as RawJsonValue;
 #[cfg(feature = "sso_login")]
 use tokio::{net::TcpListener, sync::oneshot};
 #[cfg(feature = "sso_login")]
 use tokio_stream::wrappers::TcpListenerStream;
 #[cfg(feature = "encryption")]
-use tracing::{debug, warn};
-use tracing::{error, info, instrument};
+use tracing::debug;
+use tracing::{error, info, instrument, warn};
 use url::Url;
 #[cfg(feature = "sso_login")]
 use warp::Filter;
@@ -133,9 +137,9 @@ use crate::{
 };
 use crate::{
     error::HttpError,
-    event_handler::Handler,
+    event_handler::{EventHandler, InternalEventHandlerCtx, StaticEvent},
     http_client::{client_with_config, HttpClient, HttpSend},
-    room, Error, EventHandler, Result,
+    room, Error, Result,
 };
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
@@ -150,6 +154,10 @@ const SSO_SERVER_BIND_RANGE: Range<u16> = 20000..30000;
 /// The number of times the SSO server will try to bind to a random port
 #[cfg(feature = "sso_login")]
 const SSO_SERVER_BIND_TRIES: u8 = 10;
+
+type EventHandlerFut = Pin<Box<dyn Future<Output = ()> + Send>>;
+type EventHandlerFn =
+    Box<dyn Fn(Arc<RawJsonValue>, InternalEventHandlerCtx) -> EventHandlerFut + Send + Sync>;
 
 /// An async/await enabled Matrix client.
 ///
@@ -171,9 +179,8 @@ pub struct Client {
     key_claim_lock: Arc<Mutex<()>>,
     pub(crate) members_request_locks: Arc<DashMap<RoomId, Arc<Mutex<()>>>>,
     pub(crate) typing_notice_times: Arc<DashMap<RoomId, Instant>>,
-    /// Any implementor of EventHandler will act as the callbacks for various
-    /// events.
-    event_handler: Arc<RwLock<Option<Handler>>>,
+    /// Event handlers. See `register_event_handler`.
+    event_handlers: Arc<DashMap<&'static str, Vec<EventHandlerFn>>>,
     /// Whether the client should operate in application service style mode.
     /// This is low-level functionality. For an high-level API check the
     /// `matrix_sdk_appservice` crate.
@@ -557,7 +564,7 @@ impl Client {
             key_claim_lock: Arc::new(Mutex::new(())),
             members_request_locks: Arc::new(DashMap::new()),
             typing_notice_times: Arc::new(DashMap::new()),
-            event_handler: Arc::new(RwLock::new(None)),
+            event_handlers: Arc::new(DashMap::new()),
             appservice_mode: config.appservice_mode,
         })
     }
@@ -664,9 +671,10 @@ impl Client {
         let base_client = self.base_client.clone();
         let sync_response = base_client.receive_sync_response(response).await?;
 
-        if let Some(handler) = self.event_handler.read().await.as_ref() {
-            handler.handle_sync(&sync_response).await;
-        }
+        // TODO
+        //if let Some(handler) = self.event_handler.read().await.as_ref() {
+        //    handler.handle_sync(&sync_response).await;
+        //}
 
         Ok(())
     }
@@ -862,13 +870,65 @@ impl Client {
         Ok(())
     }
 
-    /// Add `EventHandler` to `Client`.
+    /// Register a handler for a specific event type.
     ///
-    /// The methods of `EventHandler` are called when the respective
-    /// `RoomEvents` occur.
-    pub async fn set_event_handler(&self, handler: Box<dyn EventHandler>) {
-        let handler = Handler { inner: handler, client: self.clone() };
-        *self.event_handler.write().await = Some(handler);
+    /// The handler is a function or closue with one or two arguments. The first
+    /// argument is the event itself. The second argument (if there is one)
+    /// provides additional context about the event, like which room it
+    /// appeared in. It has the type
+    /// [`RoomEventCtx`][crate::event_handler::RoomEventCtx] for room-specific
+    /// events and [`GlobalEventCtx`][crate::event_handler::GlobalEventCtx]
+    /// for global events (not specific to a room).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # let client: matrix_sdk::Client = unimplemented!();
+    /// use matrix_sdk::events::{
+    ///     push_rules::PushRulesEvent,
+    ///     room::{message::MessageEvent, topic::TopicEvent},
+    /// };
+    ///
+    /// client.register_event_handler(|msg: MessageEvent, ctx| async move {
+    ///     // Most common usage: Room event plus context. `ctx.room` can be
+    ///     // used to learn more about the room `msg` was posted in.
+    /// });
+    /// client.register_event_handler(|ev: TopicEvent| async move {
+    ///     // Also possible: Omit the ctx parameter. Probably not what you want
+    ///     // for room events though.
+    /// });
+    /// client.register_event_handler(|ev: TopicEvent, ctx| async move {
+    ///     // Handler for a global event; `ctx` is a `GlobalEventCtx` here.
+    /// });
+    /// ```
+    pub fn register_event_handler<Ev, Ctx, H>(&self, handler: H)
+    where
+        Ev: StaticEvent + DeserializeOwned + Send,
+        Ctx: From<InternalEventHandlerCtx> + Send,
+        H: EventHandler<Ev, Ctx>,
+    {
+        self.event_handlers.entry(H::EVENT_TYPE).or_default().push(Box::new(
+            move |raw_json, ctx| {
+                let handler = handler.clone();
+                async move {
+                    match serde_json::from_str(raw_json.get()) {
+                        Ok(ev) => {
+                            let ctx = ctx.into();
+                            handler.handle_event(ev, ctx).await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to deserialize `{}` event, skipping event handler.\n\
+                                 Deserialization error: {}",
+                                H::EVENT_TYPE,
+                                e,
+                            );
+                        }
+                    }
+                }
+                .boxed()
+            },
+        ));
     }
 
     /// Get all the rooms the client knows about.
@@ -1927,9 +1987,10 @@ impl Client {
         let response = self.send(request, Some(request_config)).await?;
         let sync_response = self.base_client.receive_sync_response(response).await?;
 
-        if let Some(handler) = self.event_handler.read().await.as_ref() {
-            handler.handle_sync(&sync_response).await;
-        }
+        // TODO
+        //if let Some(handler) = self.event_handler.read().await.as_ref() {
+        //    handler.handle_sync(&sync_response).await;
+        //}
 
         Ok(sync_response)
     }
